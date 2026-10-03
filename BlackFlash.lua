@@ -1,4 +1,4 @@
-﻿-- Black Flash: animation-position timing + observed red GUI success cue.
+-- Black Flash: animation timing, camera backup, full-screen red GUI confirmation.
 -- Requires your client Lua runtime to provide mouse1press and mouse1release.
 -- No server remotes or animation modifications. Close AHK before using.
 local Players = game:GetService("Players")
@@ -14,7 +14,9 @@ assert(type(press)=="function" and type(release)=="function",
 
 local config = {
     Phase2 = 0.440, Phase1 = 0.283, Phase4 = 1.100,
-    ReadySeconds = 15, MaxLate = 0.040,
+    ReadySeconds = 15, MaxLate = 0.020,
+    CameraFallback = true, CameraCueAge = 0.100,
+    KeyDelay1 = 0.465, KeyDelay4 = 1.700, -- provisional camera-backed fallbacks
     AirDelay2 = 0.600, -- provisional key-to-click fallback for unmatched airborne 2
 }
 local animationMoves = {
@@ -40,9 +42,35 @@ local function reset()
     mouseUp()
 end
 local function matchesOverlay(object)
-    if not object:IsA("Frame") or object.Name ~= "Frame" then return false end
-    local parent = object.Parent
-    return parent and parent:IsA("ScreenGui") and parent.Name == "EmptyScreenGui"
+    -- Coverage and opacity checks below reject small red HUD elements.
+    return object:IsA("Frame")
+end
+local function cameraSample()
+    local ok, value = pcall(function()
+        local camera=workspace.CurrentCamera
+        local character=player.Character
+        local root=character and character:FindFirstChild("HumanoidRootPart")
+        if not camera or not root then return nil end
+        return {camera=camera, fov=camera.FieldOfView,
+            distance=(camera.CFrame.Position-root.Position).Magnitude}
+    end)
+    return ok and value or nil
+end
+local function updateCamera(current,now)
+    local sample=cameraSample()
+    local base=current.cameraBase
+    if not sample then return end
+    if not base or sample.camera~=base.camera then
+        current.cameraBase=sample;current.cameraIn=false;current.cameraOut=nil;return
+    end
+    -- Relative distance avoids interpreting ordinary character translation as a pan.
+    local zoom=base.fov-sample.fov
+    local distance=base.distance-sample.distance
+    if zoom>=3 or distance>=1.2 then current.cameraIn=true end
+    if current.cameraIn and not current.cameraOut and zoom<=1 and distance<=.4 then
+        current.cameraOut=now
+        log(tostring(current.move)..": camera returned; backup cue observed")
+    end
 end
 local function redVisible(object)
     if not object.Parent or not matchesOverlay(object) then return false end
@@ -110,7 +138,7 @@ local function startMove(move)
     else
         readyUntil=0 -- one shared use: 1 OR 4, never both from one success
     end
-    attempt={move=move,started=now,lastPressed=now,serial=serial,baseline=baseline,clicked=false,track=nil,air=airborne(),airLogs=0}
+    attempt={move=move,started=now,lastPressed=now,serial=serial,baseline=baseline,clicked=false,track=nil,air=airborne(),airLogs=0,cameraBase=cameraSample()}
     log(tostring(move)..": waiting for its animation"..(attempt.air and " (airborne)" or ""))
 end
 local function attachTrack(track)
@@ -161,6 +189,8 @@ local function click(current)
     if current.track and current.track.IsPlaying then
         log(string.format("%d: M1 at animation phase %.4f (target %.4f)",current.move,
             current.track.TimePosition,config["Phase"..current.move]))
+    elseif current.source=="camera" then
+        log(string.format("%d: camera-backed fallback M1 at %.4fs; provisional timing",current.move,os.clock()-current.started))
     else
         log(string.format("Air %d: fallback M1 at %.4fs from key (target %.4fs)",
             current.move,os.clock()-current.started,config.AirDelay2))
@@ -185,13 +215,17 @@ connect(UIS.InputBegan,function(input)
     elseif key==Enum.KeyCode.Two then startMove(2)
     elseif key==Enum.KeyCode.Four then startMove(4) end
 end)
-connect(Run.Heartbeat,function()
+local function step()
     if stopped then return end
     local now=os.clock()
     if down and now-downAt>.15 then mouseUp() end
     local current=attempt
     if not current then return end
     if not enabled or not focused then reset();return end
+    local character=player.Character
+    local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+    if humanoid and humanoid.Health and humanoid.Health<=0 then reset();return end
+    updateCamera(current,now)
     local expiryStart=current.clickedAt or current.matchedAt or current.lastPressed or current.started
     if now-expiryStart>3.2 then attempt=nil;log("Attempt expired");return end
     if current.move==2 and current.clicked then
@@ -219,7 +253,21 @@ connect(Run.Heartbeat,function()
         end
         return
     end
-    if not track then return end
+    if not track then
+        if config.CameraFallback and current.move~=2 then
+            local elapsed=now-current.started
+            local target=config["KeyDelay"..current.move]
+            if elapsed>=target then
+                if elapsed-target<=config.MaxLate and current.cameraOut
+                    and now-current.cameraOut<=config.CameraCueAge then
+                    current.source="camera";click(current)
+                else
+                    attempt=nil;log(tostring(current.move)..": no timely camera/animation cue; skipped")
+                end
+            end
+        end
+        return
+    end
     if not track.IsPlaying then attempt=nil;log("Animation stopped before timing");return end
     local phase=track.TimePosition
     local target=config["Phase"..current.move]
@@ -227,7 +275,11 @@ connect(Run.Heartbeat,function()
         if phase-target>config.MaxLate then attempt=nil;log("Timing passed: skipped late click")
         else click(current) end
     end
-end)
+end
+-- Check animation phase before rendering, plus Heartbeat for cleanup and success cues.
+-- The clicked flag prevents duplicate input when both signals run in one frame.
+if Run.PreRender then connect(Run.PreRender,step) end
+connect(Run.Heartbeat,step)
 env.BlackFlashMacro={
     Config=config,
     Stop=function()
