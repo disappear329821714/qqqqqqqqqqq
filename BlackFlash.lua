@@ -17,6 +17,7 @@ local config = {
     ReadySeconds = 15, MaxLate = 0.020,
     CameraFallback = true, CameraCueAge = 0.100,
     KeyDelay1 = 0.465, KeyDelay4 = 1.700, -- provisional camera-backed fallbacks
+    AirCameraTiming = true, AirCameraPhase2 = 0.440, AirCameraTimeout = 1.200,
     AirDelay2 = 0.600, -- provisional key-to-click fallback for unmatched airborne 2
 }
 local animationMoves = {
@@ -67,6 +68,11 @@ local function updateCamera(current,now)
     local zoom=base.fov-sample.fov
     local distance=base.distance-sample.distance
     if zoom>=3 or distance>=1.2 then current.cameraIn=true end
+    -- FOV onset is independent of jumping changing the root-to-camera distance.
+    if not current.zoomStarted and zoom>=.5 then
+        current.zoomStarted=now
+        log(string.format("%d: zoom started %.4fs after key",current.move,now-current.started))
+    end
     if current.cameraIn and not current.cameraOut and zoom<=1 and distance<=.4 then
         current.cameraOut=now
         log(tostring(current.move)..": camera returned; backup cue observed")
@@ -192,8 +198,8 @@ local function click(current)
     elseif current.source=="camera" then
         log(string.format("%d: camera-backed fallback M1 at %.4fs; provisional timing",current.move,os.clock()-current.started))
     else
-        log(string.format("Air %d: fallback M1 at %.4fs from key (target %.4fs)",
-            current.move,os.clock()-current.started,config.AirDelay2))
+        log(string.format("Air %d: fallback M1 at %.4fs from timing anchor (target %.4fs)",
+            current.move,os.clock()-(current.airAnchor or current.started),current.airTarget or config.AirDelay2))
     end
     if current.move~=2 then attempt=nil end
 end
@@ -204,7 +210,7 @@ connect(UIS.InputBegan,function(input)
         enabled=not enabled;reset();log(enabled and "ON" or "OFF");return
     elseif key==Enum.KeyCode.F3 then reset();pcall(release);log("Reset");return
     elseif key==Enum.KeyCode.F10 then env.BlackFlashMacro.Stop();return end
-    if input.UserInputType==Enum.UserInputType.MouseButton1 and not down and attempt then
+    if input.UserInputType==Enum.UserInputType.MouseButton1 and not down and attempt and not attempt.clicked then
         if attempt.move==2 then
             -- A manual click may still legitimately produce the success cue.
             attempt.clicked=true;attempt.clickedAt=os.clock()
@@ -241,13 +247,26 @@ local function step()
         return
     end
     -- A matched playing track uses the original animation timing.
-    -- Unmatched/stopped airborne 2 uses its own key-relative fallback.
+    -- Unmatched/stopped airborne 2 uses FOV-onset timing; legacy delay is opt-in.
     local track=current.track
     if current.move==2 and not track then current.air=current.air or airborne() end
     if current.move==2 and current.air and (not track or not track.IsPlaying) then
-        local elapsed=now-current.started
-        if elapsed>=config.AirDelay2 then
-            if elapsed-config.AirDelay2>config.MaxLate then
+        local anchor=current.started
+        local target=config.AirDelay2
+        if config.AirCameraTiming then
+            if not current.zoomStarted then
+                if now-current.started>config.AirCameraTimeout then
+                    attempt=nil;log("Air 2: no FOV zoom onset; skipped instead of guessing")
+                end
+                return
+            end
+            anchor=current.zoomStarted
+            target=config.AirCameraPhase2
+        end
+        current.airAnchor=anchor;current.airTarget=target
+        local elapsed=now-anchor
+        if elapsed>=target then
+            if elapsed-target>config.MaxLate then
                 attempt=nil;log("Air 2: fallback deadline missed; skipped")
             else click(current) end
         end
