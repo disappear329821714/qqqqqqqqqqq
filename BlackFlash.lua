@@ -38,7 +38,8 @@ assert(type(press)=="function" and type(release)=="function",
     "This runtime must provide mouse1press and mouse1release; no input was sent.")
 
 local config = {
-    Character = "Sukuna", NanamiKey = 1, NanamiTolerance = 0.75, NanamiLeadMs = 0,
+    Character = "Sukuna", NanamiMoves = {[1]=true,[2]=true,[3]=true},
+    NanamiTimeouts = {[1]=3,[2]=4,[3]=8}, NanamiTolerance = 0.75, NanamiLeadMs = 0,
     Phase2 = 0.440, Phase1 = 0.283, Phase4 = 1.100,
     ReadySeconds = 15, MaxLate = 0.020,
     CameraFallback = true, CameraCueAge = 0.100,
@@ -54,12 +55,26 @@ local animationMoves = {
 local connections, characterConnections, overlays = {}, {}, {}
 local enabled, stopped, down, focused = true, false, false, true
 local attempt, readyUntil, downAt, serial = nil, 0, 0, 0
-local Library, libraryScreen, statusLabel
-local indicatorObjects={}
+local Library, libraryScreen
+local indicatorObjects=setmetatable({}, {__mode="k"}) -- GUI only; no retained scene parts
+local guiCandidates,guiPositions={},{}
+local guiCursor=0
+local nanamiCache={}
+local queryParams
+pcall(function()
+    queryParams=OverlapParams.new()
+    queryParams.MaxParts=96
+end)
 local nanamiStep
-local function log(message)
-    print("[BF-LUA] "..message)
-    if statusLabel then statusLabel:SetText(message) end
+local function clear(t) for key in pairs(t) do t[key]=nil end end
+local function ownedGui(object)
+    if not libraryScreen then return false end
+    local parent=object
+    while parent do
+        if parent==libraryScreen then return true end
+        parent=parent.Parent
+    end
+    return false
 end
 local function connect(signal, callback)
     local connection = signal:Connect(callback)
@@ -76,7 +91,9 @@ local function reset()
 end
 local function matchesOverlay(object)
     -- Coverage and opacity checks below reject small red HUD elements.
-    return object:IsA("Frame")
+    local parent=object.Parent
+    return object:IsA("Frame") and object.Name=="Frame" and parent
+        and parent:IsA("ScreenGui") and parent.Name=="EmptyScreenGui"
 end
 local function cameraSample()
     local ok, value = pcall(function()
@@ -103,11 +120,11 @@ local function updateCamera(current,now)
     -- FOV onset is independent of jumping changing the root-to-camera distance.
     if not current.zoomStarted and zoom>=.5 then
         current.zoomStarted=now
-        log(string.format("%d: zoom started %.4fs after key",current.move,now-current.started))
+        
     end
     if current.cameraIn and not current.cameraOut and zoom<=1 and distance<=.4 then
         current.cameraOut=now
-        log(tostring(current.move)..": camera returned; backup cue observed")
+        
     end
 end
 local function redVisible(object)
@@ -128,21 +145,66 @@ local function redVisible(object)
         if ancestor:IsA("CanvasGroup") then alpha=alpha*(1-ancestor.GroupTransparency) end
         ancestor=ancestor.Parent
     end
+    if ancestor~=player.PlayerGui then return false end
     local color=object.BackgroundColor3
     return alpha>=.35 and color.R>=.25 and color.G<=.10 and color.B<=.10
 end
+local function hint(parent,object)
+    local current=attempt
+    if not current or current.profile~="Nanami" or not parent then return end
+    if object then
+        current.newCursor=current.newCursor%64+1
+        current.newObjects[current.newCursor]=object
+    end
+    if current.hintCount>=16 then return end
+    if not current.hints[parent] then
+        current.hints[parent]=true;current.hintCount=current.hintCount+1
+    end
+    current.searchAt=0
+end
 local function observe(object)
-    if object:IsA("GuiObject") or object:IsA("BasePart") then indicatorObjects[object]=true end
-    if matchesOverlay(object) then overlays[object]=true end
+    if object:IsA("GuiObject") and not ownedGui(object) then
+        if not guiPositions[object] then
+            guiCandidates[#guiCandidates+1]=object;guiPositions[object]=#guiCandidates
+            indicatorObjects[object]=true
+        end
+        if matchesOverlay(object) then overlays[object]=true end
+        hint(object.Parent,object)
+    elseif object:IsA("BasePart") then
+        -- Newly spawned effects are hints only during an active Nanami attempt.
+        hint(object.Parent,object)
+    end
+end
+local function forget(object)
+    overlays[object]=nil;indicatorObjects[object]=nil
+    local position=guiPositions[object]
+    if position then
+        local last=guiCandidates[#guiCandidates]
+        guiCandidates[position]=last;guiCandidates[#guiCandidates]=nil
+        guiPositions[object]=nil
+        if last~=object then guiPositions[last]=position end
+    end
+    for move,pair in pairs(nanamiCache) do
+        if pair.bar==object or pair.red==object or pair.black==object then nanamiCache[move]=nil end
+    end
+    if attempt and attempt.indicator and (attempt.indicator.bar==object
+        or attempt.indicator.red==object or attempt.indicator.black==object) then
+        attempt.indicator=nil;attempt.previousGap=nil;attempt.previousSample=nil
+    end
+    if attempt then
+        if attempt.hints[object] then attempt.hints[object]=nil end
+        for index,item in pairs(attempt.newObjects) do
+            if item==object then attempt.newObjects[index]=nil end
+        end
+    end
 end
 local gui=player:WaitForChild("PlayerGui")
 for _,object in ipairs(gui:GetDescendants()) do observe(object) end
 connect(gui.DescendantAdded,observe)
-connect(gui.DescendantRemoving,function(object) overlays[object]=nil;indicatorObjects[object]=nil end)
-
-for _,object in ipairs(workspace:GetDescendants()) do observe(object) end
+connect(gui.DescendantRemoving,forget)
+-- Existing world parts are queried locally; never traverse or retain the scene.
 connect(workspace.DescendantAdded,observe)
-connect(workspace.DescendantRemoving,function(object) indicatorObjects[object]=nil end)
+connect(workspace.DescendantRemoving,forget)
 
 local function airborne()
     local character = player.Character
@@ -159,6 +221,14 @@ end
 local function startMove(move)
     if not enabled or stopped or not focused or UIS:GetFocusedTextBox() then return end
     local now=os.clock()
+    if attempt and config.Character=="Nanami" and attempt.profile=="Nanami" then
+        if attempt.move==move then
+            if not attempt.indicator then attempt.started=now;attempt.lastPressed=now end
+            return
+        end
+        -- A move with no indicator must not block the next Nanami input.
+        attempt=nil
+    end
     if attempt then
         -- Repeated keys refresh only the pre-animation input association.
         -- Once matched, keep the original track, phase target and air deadline.
@@ -167,42 +237,41 @@ local function startMove(move)
         end
         return
     end
-    if config.Character~="Nanami" and move~=2 and now>=readyUntil then log(tostring(move).." blocked: land 2 first"); return end
+    if config.Character~="Nanami" and move~=2 and now>=readyUntil then  return end
     -- Never overlap a tracked injected hold with a new attempt.
-    if down then log("Release M1 before starting another move"); return end
+    if down then  return end
     if UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
-        log("Release M1 before using the macro"); return
+         return
     end
     serial=serial+1
     local baseline={}
-    if move==2 then
+    if move==2 and config.Character~="Nanami" then
         readyUntil=0
         for object in pairs(overlays) do baseline[object]=redVisible(object) end
     else
         readyUntil=0 -- one shared use: 1 OR 4, never both from one success
     end
-    attempt={profile=config.Character,move=move,started=now,lastPressed=now,serial=serial,baseline=baseline,clicked=false,track=nil,air=airborne(),airLogs=0,cameraBase=cameraSample()}
-    log(config.Character=="Nanami" and "Nanami: waiting for Bisecting Slash indicator" or tostring(move)..": waiting for its animation"..(attempt.air and " (airborne)" or ""))
+    attempt={profile=config.Character,move=move,started=now,lastPressed=now,serial=serial,baseline=baseline,clicked=false,track=nil,air=airborne(),cameraBase=config.Character~="Nanami" and cameraSample() or nil,
+        hints={},hintCount=0,newObjects={},newCursor=0,indicator=nil}
+    local cached=config.Character=="Nanami" and nanamiCache[move]
+    if cached and cached.bar.Parent then hint(cached.bar.Parent) end
+    
 end
 local function attachTrack(track)
     if not attempt or attempt.profile=="Nanami" or attempt.clicked or attempt.track then return end
     local animation=track.Animation
     local id=animation and animation.AnimationId:match("%d+")
     if animationMoves[id]~=attempt.move then
-        if attempt.move==2 and attempt.air and attempt.airLogs<5 then
-            attempt.airLogs=attempt.airLogs+1
-            log("Air 2 observed animation "..tostring(id))
-        end
         return
     end
     local age=os.clock()-(attempt.lastPressed or attempt.started)
     if age > (attempt.move==4 and 1.4 or .8) then return end
     attempt.track=track
     attempt.matchedAt=os.clock()
-    log(tostring(attempt.move)..": animation "..id.." matched")
+    
 end
 local function bindCharacter(character)
-    reset()
+    reset();clear(nanamiCache)
     for _,connection in ipairs(characterConnections) do connection:Disconnect() end
     characterConnections={}
     task.spawn(function()
@@ -210,9 +279,9 @@ local function bindCharacter(character)
         if not humanoid or stopped or player.Character~=character then return end
         local animator=humanoid:WaitForChild("Animator",10)
         if not animator or stopped or player.Character~=character then return end
-        table.insert(characterConnections,connect(animator.AnimationPlayed,attachTrack))
-        table.insert(characterConnections,connect(humanoid.Died,reset))
-        log("Character ready")
+        table.insert(characterConnections,animator.AnimationPlayed:Connect(attachTrack))
+        table.insert(characterConnections,humanoid.Died:Connect(reset))
+        
     end)
 end
 connect(player.CharacterAdded,bindCharacter)
@@ -222,43 +291,32 @@ connect(UIS.WindowFocused,function() focused=true end)
 local function click(current)
     if current~=attempt or current.clicked or not enabled or not focused then return end
     if UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
-        log("M1 held: automatic click skipped");attempt=nil;return
+        attempt=nil;return
     end
     current.clicked=true
     current.clickedAt=os.clock()
-    local ok,err=pcall(function() down=true;downAt=os.clock();press() end)
-    if not ok then mouseUp();attempt=nil;log("Input failed: "..tostring(err));return end
-    task.delay(.025,mouseUp)
-    if current.source=="nanami" then
-        log("Nanami: M1 at colored line crossing")
-    elseif current.track and current.track.IsPlaying then
-        log(string.format("%d: M1 at animation phase %.4f (target %.4f)",current.move,
-            current.track.TimePosition,config["Phase"..current.move]))
-    elseif current.source=="camera" then
-        log(string.format("%d: camera-backed fallback M1 at %.4fs; provisional timing",current.move,os.clock()-current.started))
-    else
-        log(string.format("Air %d: fallback M1 at %.4fs from timing anchor (target %.4fs)",
-            current.move,os.clock()-(current.airAnchor or current.started),current.airTarget or config.AirDelay2))
-    end
+    local ok=pcall(function() down=true;downAt=os.clock();press() end)
+    if not ok then mouseUp();attempt=nil;return end
+    -- Mouse release is handled by the shared watchdog, without delayed closures.
     if current.profile=="Nanami" or current.move~=2 then attempt=nil end
 end
 connect(UIS.InputBegan,function(input)
     if stopped or UIS:GetFocusedTextBox() then return end
     local key=input.KeyCode
     if key==Enum.KeyCode.F2 then
-        enabled=not enabled;reset();if Library and Library.Toggles.BFEnabled then Library.Toggles.BFEnabled:SetValue(enabled) end;log(enabled and "ON" or "OFF");return
-    elseif key==Enum.KeyCode.F3 then reset();pcall(release);log("Reset");return
+        enabled=not enabled;reset();if Library and Library.Toggles.BFEnabled then Library.Toggles.BFEnabled:SetValue(enabled) end;return
+    elseif key==Enum.KeyCode.F3 then reset();pcall(release);return
     elseif key==Enum.KeyCode.F10 then env.BlackFlashMacro.Stop();return end
     if input.UserInputType==Enum.UserInputType.MouseButton1 and not down and attempt and not attempt.clicked then
         if attempt.profile~="Nanami" and attempt.move==2 then
             -- A manual click may still legitimately produce the success cue.
             attempt.clicked=true;attempt.clickedAt=os.clock()
         else attempt=nil end
-        log("Manual M1 replaced automatic click");return
+        return
     end
     if config.Character=="Nanami" then
         local move=key==Enum.KeyCode.One and 1 or key==Enum.KeyCode.Two and 2 or key==Enum.KeyCode.Three and 3 or key==Enum.KeyCode.Four and 4
-        if move==config.NanamiKey then startMove(move) end
+        if move and config.NanamiMoves[move] then startMove(move) end
         return
     end
     if key==Enum.KeyCode.One then startMove(1)
@@ -274,6 +332,10 @@ end
 local function geometry(o)
     if not o.Parent then return end
     if o:IsA("GuiObject") then
+        if o.BackgroundTransparency>.35 then return end
+        local kind=colorKind(o.BackgroundColor3)
+        local size=o.AbsoluteSize
+        if not kind or size.X<1 or size.Y<1 or math.max(size.X,size.Y)<math.min(size.X,size.Y)*2 then return end
         local a=o
         while a do
             if a==libraryScreen then return end
@@ -291,7 +353,7 @@ local function geometry(o)
         return {kind=colorKind(o.BackgroundColor3),mode="gui",x=p.X+s.X/2,y=p.Y+s.Y/2,
             ax=ax,ay=ay,length=math.max(s.X,s.Y),thickness=math.min(s.X,s.Y),object=o}
     elseif o:IsA("BasePart") then
-        if o.Transparency>.35 then return end
+        if o.Transparency>.35 or not colorKind(o.Color) then return end
         local root=player.Character and player.Character:FindFirstChild("HumanoidRootPart")
         if not root or (o.Position-root.Position).Magnitude>35 then return end
         local s=o.Size
@@ -316,43 +378,81 @@ local function siblings(a,b)
     local pa,pb=a.Parent,b.Parent
     return pa==pb or (pa and pb and pa.Parent==pb) or (pa and pb and pb.Parent==pa)
 end
-local function discoverIndicator()
-    local shapes={}
-    -- Only nearby world objects are considered; GUI candidates are indexed once.
-    local nearby={}
-    local ok,parts=pcall(function()
+-- Bounded acquisition runs on Heartbeat; timing reads only the cached triplet.
+local function discoverIndicator(current)
+    local shapes,seen={},{}
+    local deadline=os.clock()+.0008
+    local function add(object)
+        if #shapes>=192 or seen[object] then return end
+        seen[object]=true
+        local ok,g=pcall(geometry,object)
+        if ok and g and g.kind and g.length>=g.thickness*2 then shapes[#shapes+1]=g end
+    end
+    -- A fixed-size ring gives fresh marker objects priority even in large GUIs.
+    for _,object in pairs(current.newObjects) do add(object) end
+    -- Spawned indicator parents take priority over ambient GUI and world objects.
+    for parent in pairs(current.hints) do
+        local ok,children=pcall(function() return parent:GetChildren() end)
+        if ok then
+            for i=1,math.min(#children,64) do add(children[i]) end
+        end
+        if os.clock()>=deadline then break end
+    end
+    local partsOK,parts=pcall(function()
         local root=player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-        return root and workspace:GetPartBoundsInRadius(root.Position,35) or {}
+        return root and workspace:GetPartBoundsInRadius(root.Position,24,queryParams) or {}
     end)
-    if ok then for _,o in ipairs(parts) do nearby[o]=true end end
-    for o in pairs(indicatorObjects) do
-        if o:IsA("GuiObject") or nearby[o] then
-            local valid,g=pcall(geometry,o)
-            if valid and g and g.kind then shapes[#shapes+1]=g end
+    if partsOK then
+        for i=1,math.min(#parts,96) do
+            add(parts[i])
+            if os.clock()>=deadline then break end
         end
     end
-    local found=nil
-    for _,bar in ipairs(shapes) do
-        if bar.kind=="white" and bar.length>=bar.thickness*8 then
-            local reds,blacks={},{}
-            for _,line in ipairs(shapes) do
-                if line~=bar and (line.kind=="red" or line.kind=="black")
-                    and siblings(bar.object,line.object) and line.length<bar.length*.32 then
-                    local x,y=project(bar,line)
-                    if x and math.abs(x)<=.6 and y<=.12 then
-                        local list=line.kind=="red" and reds or blacks
-                        list[#list+1]=line
+    -- A rotating cursor gives older GUI candidates a bounded share of search time.
+    for _=1,math.min(#guiCandidates,192) do
+        guiCursor=guiCursor%#guiCandidates+1
+        add(guiCandidates[guiCursor])
+        if os.clock()>=deadline then break end
+    end
+    local groups={}
+    local function groupAdd(parent,shape)
+        if not parent then return end
+        local group=groups[parent]
+        if not group then group={bars={},lines={}};groups[parent]=group end
+        if shape.kind=="white" and shape.length>=shape.thickness*8 then
+            group.bars[#group.bars+1]=shape
+        elseif shape.kind=="red" or shape.kind=="black" then
+            group.lines[#group.lines+1]=shape
+        end
+    end
+    for _,shape in ipairs(shapes) do
+        local parent=shape.object.Parent
+        groupAdd(parent,shape)
+        groupAdd(parent and parent.Parent,shape)
+    end
+    local found
+    for _,group in pairs(groups) do
+        -- Oversized or ambiguous buckets are skipped rather than growing work.
+        if #group.bars<=8 and #group.lines<=48 then
+            for _,bar in ipairs(group.bars) do
+                local red,black,reds,blacks=nil,nil,0,0
+                for _,line in ipairs(group.lines) do
+                    if siblings(bar.object,line.object) and line.length<bar.length*.32 then
+                        local x,y=project(bar,line)
+                        if x and math.abs(x)<=.6 and y<=.12 then
+                            if line.kind=="red" then red=line.object;reds=reds+1
+                            else black=line.object;blacks=blacks+1 end
+                        end
                     end
                 end
-            end
-            -- Ambiguous indicators never become a timing source.
-            if #reds==1 and #blacks==1 then
-                if found then return nil,"Multiple indicators found" end
-                found={bar=bar.object,red=reds[1].object,black=blacks[1].object}
+                if reds==1 and blacks==1 then
+                    if found and (found.bar~=bar.object or found.red~=red or found.black~=black) then return end
+                    found={bar=bar.object,red=red,black=black}
+                end
             end
         end
     end
-    return found,found and "Indicator found" or "Waiting for colored indicator"
+    return found
 end
 local function sampleIndicator(pair)
     local ok,bar,red,black=pcall(function()
@@ -364,29 +464,23 @@ local function sampleIndicator(pair)
     if not rx or not bx or ry>.12 or by>.12 or math.abs(rx)>.6 or math.abs(bx)>.6 then return end
     return bx-rx,bar.length
 end
-nanamiStep=function(current,now)
-    if now-current.started>3 then attempt=nil;log("Nanami: indicator timeout; skipped");return end
-    if not current.indicator and now>=(current.searchAt or 0) then
-        current.searchAt=now+.08
-        current.indicator=discoverIndicator()
-        if current.indicator then log("Nanami: colored indicator acquired") end
-        if config.NanamiCapture and now-current.started>.05 and not current.captured then
-            current.captured=true;config.NanamiCapture=false
-            local count=0
-            for object in pairs(indicatorObjects) do
-                local ok,g=pcall(geometry,object)
-                if ok and g and g.kind and g.length>=g.thickness*3 then
-                    count=count+1
-                    if count<=40 then log(string.format("Indicator candidate: %s %s L=%.2f %s",g.kind,g.mode,g.length,object:GetFullName())) end
-                end
-            end
-            log("Captured "..count.." colored candidates; share this log if no indicator matches")
-        end
+local function acquireIndicator(now)
+    local current=attempt
+    if not current or current.profile~="Nanami" or current.clicked or current.indicator then return end
+    if now<(current.searchAt or 0) then return end
+    current.searchAt=now+.05
+    current.indicator=discoverIndicator(current)
+    if current.indicator then
+        nanamiCache[current.move]=current.indicator
+        clear(current.hints);clear(current.newObjects);current.hintCount=0
     end
+end
+nanamiStep=function(current,now)
+    if now-current.started>(config.NanamiTimeouts[current.move] or 3) then attempt=nil;return end
     if not current.indicator then return end
     local gap,length=sampleIndicator(current.indicator)
     if not gap then
-        current.indicator=nil;current.previousGap=nil;current.previousSample=nil;return
+        nanamiCache[current.move]=nil;current.indicator=nil;current.previousGap=nil;current.previousSample=nil;return
     end
     local previous=current.previousGap
     local dt=current.previousSample and now-current.previousSample or 0
@@ -404,7 +498,7 @@ nanamiStep=function(current,now)
         if current.approaching and (math.abs(gap)<=tolerance or crossing
             or (approaching and eta>=0 and eta<=lead)) then
             current.source="nanami"
-            log(string.format("Nanami: indicator gap %.3f%%",gap*100))
+            
             click(current);return
         end
     end
@@ -424,14 +518,14 @@ local function step()
     if current.profile=="Nanami" then nanamiStep(current,now);return end
     updateCamera(current,now)
     local expiryStart=current.clickedAt or current.matchedAt or current.lastPressed or current.started
-    if now-expiryStart>3.2 then attempt=nil;log("Attempt expired");return end
+    if now-expiryStart>3.2 then attempt=nil;return end
     if current.move==2 and current.clicked then
-        if now-current.clickedAt>1.5 then attempt=nil;log("2: no success flash; 1/4 remain blocked");return end
+        if now-current.clickedAt>1.5 then attempt=nil;return end
         if now-current.clickedAt>=.15 then
             for object in pairs(overlays) do
                 if not current.baseline[object] and redVisible(object) then
                     readyUntil=now+config.ReadySeconds;attempt=nil
-                    log("2 CONFIRMED by red GUI: one use of 1 OR 4 armed");return
+                    return
                 end
             end
         end
@@ -447,7 +541,7 @@ local function step()
         if config.AirCameraTiming then
             if not current.zoomStarted then
                 if now-current.started>config.AirCameraTimeout then
-                    attempt=nil;log("Air 2: no FOV zoom onset; skipped instead of guessing")
+                    attempt=nil;
                 end
                 return
             end
@@ -458,7 +552,7 @@ local function step()
         local elapsed=now-anchor
         if elapsed>=target then
             if elapsed-target>config.MaxLate then
-                attempt=nil;log("Air 2: fallback deadline missed; skipped")
+                attempt=nil;
             else click(current) end
         end
         return
@@ -472,40 +566,52 @@ local function step()
                     and now-current.cameraOut<=config.CameraCueAge then
                     current.source="camera";click(current)
                 else
-                    attempt=nil;log(tostring(current.move)..": no timely camera/animation cue; skipped")
+                    attempt=nil;
                 end
             end
         end
         return
     end
-    if not track.IsPlaying then attempt=nil;log("Animation stopped before timing");return end
+    if not track.IsPlaying then attempt=nil;return end
     local phase=track.TimePosition
     local target=config["Phase"..current.move]
     if phase>=target then
-        if phase-target>config.MaxLate then attempt=nil;log("Timing passed: skipped late click")
+        if phase-target>config.MaxLate then attempt=nil;
         else click(current) end
     end
 end
--- Check animation phase before rendering, plus Heartbeat for cleanup and success cues.
--- The clicked flag prevents duplicate input when both signals run in one frame.
+-- Heavy discovery never runs inside the render callback.
+local function backgroundStep()
+    if stopped then return end
+    local now=os.clock()
+    if down and now-downAt>=.025 then mouseUp() end
+    acquireIndicator(now)
+    if not Run.PreRender then step() end
+end
 if Run.PreRender then connect(Run.PreRender,step) end
-connect(Run.Heartbeat,step)
+connect(Run.Heartbeat,backgroundStep)
+
 env.BlackFlashMacro={
     Config=config,
     SelectCharacter=function(value)
         assert(value=="Sukuna" or value=="Nanami","Unknown character")
-        reset();config.Character=value;log("Selected "..value)
+        reset();clear(nanamiCache);config.Character=value;
     end,
     Stop=function()
         if stopped then return end
         stopped=true;reset()
         for _,connection in ipairs(connections) do connection:Disconnect() end
+        for _,connection in ipairs(characterConnections) do connection:Disconnect() end
+        clear(connections);clear(characterConnections);clear(overlays)
+        clear(indicatorObjects);clear(guiCandidates);clear(guiPositions);clear(nanamiCache)
         env.BlackFlashMacro=nil
         if Library and not Library.Unloaded then Library:Unload() end
-        log("Stopped")
+        Library=nil;libraryScreen=nil
+        
     end,
 }
-log("Ready. Select Sukuna or Nanami in the menu. F2 toggle, F3 reset, F10 stop.")
+
+
 
 -- BEGIN BUNDLED OBSIDIAN
 local function loadObsidian()
@@ -666,9 +772,7 @@ do
         return success, errorMessage
     end
 
-    for AssetName, _ in CustomImageManagerAssets do
-        CustomImageManager.DownloadAsset(AssetName)
-    end
+    -- Use the bundled Roblox asset IDs; no optional file downloads at startup.
 end
 
 local Library = {
@@ -2453,14 +2557,7 @@ function Library:SetIconModule(module: IconModule)
     CloseIcon = Library:GetIcon("x")
 end
 
-local OnlineFetchIcons, OnlineIcons = pcall(function()
-    return (loadstring(
-        game:HttpGet("https://raw.githubusercontent.com/notpoiu/lucide-roblox-direct/refs/heads/main/source.lua")
-    ) :: () -> IconModule)()
-end)
-if OnlineFetchIcons and OnlineIcons then
-    Library:SetIconModule(OnlineIcons)
-end
+-- Optional online icon loading omitted for this compact menu.
 
 --// Lib Functions \\--
 Library.Cursor = {}
@@ -6052,7 +6149,7 @@ do
 
         local function RefreshFooterInfo()
             FooterInfoLabel.Text = string.format(
-                "#%s • %d, %d, %d",
+                "#%s â€¢ %d, %d, %d",
                 ColorPicker.Value:ToHex(),
                 math.floor(ColorPicker.Value.R * 255),
                 math.floor(ColorPicker.Value.G * 255),
@@ -11624,6 +11721,7 @@ function Library:CreateWindow(WindowInfo)
             })
         )
 
+        if HasBackgroundImage then
         Library:GiveSignal(RunService.RenderStepped:Connect(function()
             if not (BackgroundImage and MainFrame) then
                 return
@@ -11645,6 +11743,7 @@ function Library:CreateWindow(WindowInfo)
                 MainFrame.AbsoluteSize.Y
             )
         end))
+        end
 
         if WindowInfo.Center then
             MainFrame.Position = UDim2.new(0.5, -MainFrame.Size.X.Offset / 2, 0.5, -MainFrame.Size.Y.Offset / 2)
@@ -14613,7 +14712,7 @@ function Library:CreateWindow(WindowInfo)
             ModalElement.Modal = Library.Toggled
         end
 
-        if Library.Toggled and not Library.IsMobile then
+        if Library.Toggled and not Library.IsMobile and Library.ShowCustomCursor then
             local ShowCursorBinding = Library.ShowCursorBinding
             Library.OriginalMouseIconEnabled = UserInputService.MouseIconEnabled
 
@@ -15641,50 +15740,39 @@ end
 local uiOK,uiError=pcall(function()
     Library=loadObsidian()
     Library.ToggleKeybind=Enum.KeyCode.RightShift
-    local window=Library:CreateWindow({Title="Black Flash",Footer="Sukuna / Nanami",AutoShow=true,Center=true,ShowCustomCursor=false})
+    local window=Library:CreateWindow({Title="Black Flash",Footer="",AutoShow=true,Center=true,
+        Size=UDim2.fromOffset(540,360),Resizable=false,ShowCustomCursor=false,
+        UnlockMouseWhileOpen=true,MinContainerWidth=440})
     libraryScreen=Library.ScreenGui
-    local tab=window:AddTab("Characters")
-    local main=tab:AddLeftGroupbox("Controls")
+    -- Remove any UI objects seen while the library was being constructed.
+    for index=#guiCandidates,1,-1 do
+        local object=guiCandidates[index]
+        if ownedGui(object) then forget(object) end
+    end
+    local tab=window:AddTab("Main")
+    local main=tab:AddLeftGroupbox("Macro")
     main:AddDropdown("BFCharacter",{Text="Character",Values={"Sukuna","Nanami"},Default=1,Multi=false,
         Callback=function(value) env.BlackFlashMacro.SelectCharacter(value) end})
-    main:AddToggle("BFEnabled",{Text="Macro enabled",Default=true,Callback=function(value) enabled=value;reset() end})
-    main:AddButton({Text="Reset timing / release M1",Func=function() reset();log("Reset") end})
-    main:AddButton({Text="Stop / close",Func=function() env.BlackFlashMacro.Stop() end})
-    main:AddLabel("F2 toggle | F3 reset | F10 stop")
-    main:AddLabel("Right Shift shows/hides this menu")
-    statusLabel=main:AddLabel("Ready",true)
-    local nano=tab:AddRightGroupbox("Nanami - Bisecting Slash")
-    nano:AddDropdown("BFNanamiKey",{Text="Move slot",Values={"1","2","3","4"},Default=1,
-        Callback=function(value) reset();config.NanamiKey=tonumber(value) end})
-    nano:AddSlider("BFNanamiTolerance",{Text="Line tolerance (% of bar)",Default=.75,Min=.1,Max=3,Rounding=2,
+    main:AddToggle("BFEnabled",{Text="Enabled",Default=true,Callback=function(value) enabled=value;reset() end})
+    main:AddButton({Text="Close UI",Func=function() Library:Toggle(false) end})
+    main:AddButton({Text="Stop macro",Func=function() env.BlackFlashMacro.Stop() end})
+    local nano=tab:AddRightGroupbox("Nanami")
+    local moves={"1 - Bisecting Slash","2 - 7:3 Combo","3 - Hair Grab"}
+    for move=1,3 do
+        local slot=move
+        nano:AddToggle("BFNanamiMove"..slot,{Text=moves[slot],Default=true,
+            Callback=function(value) config.NanamiMoves[slot]=value;reset() end})
+    end
+    local settings=window:AddTab("Timing")
+    local timing=settings:AddLeftGroupbox("Nanami")
+    timing:AddSlider("BFNanamiTolerance",{Text="Tolerance (%)",Default=.75,Min=.1,Max=3,Rounding=2,
         Callback=function(value) config.NanamiTolerance=value end})
-    nano:AddSlider("BFNanamiLead",{Text="Input lead (ms)",Default=0,Min=0,Max=30,Rounding=0,
+    timing:AddSlider("BFNanamiLead",{Text="Input lead (ms)",Default=0,Min=0,Max=30,Rounding=0,
         Callback=function(value) config.NanamiLeadMs=value end})
-    nano:AddLabel("Press the move key. M1 fires as the black line reaches red.",true)
-    nano:AddLabel("Only identified colored geometry is used; ambiguous cues skip.",true)
-    nano:AddButton({Text="Capture next indicator",Func=function()
-        config.NanamiCapture=true;log("Capture armed: close menu and use Bisecting Slash")
-    end})
-    nano:AddButton({Text="Print indicator diagnostics",Func=function()
-        local pair,reason=discoverIndicator();log(reason)
-        if pair then
-            for name,object in pairs(pair) do log(name..": "..object:GetFullName()) end
-        else
-            local count=0
-            for object in pairs(indicatorObjects) do
-                local ok,g=pcall(geometry,object)
-                if ok and g and g.kind and g.length>=g.thickness*3 then
-                    count=count+1
-                    if count<=35 then log(g.kind.." "..g.mode.." "..object:GetFullName()) end
-                end
-            end
-            log("Candidates: "..count)
-        end
-    end})
     Library:OnUnload(function() if env.BlackFlashMacro then env.BlackFlashMacro.Stop() end end)
 end)
 if not uiOK then
     if Library then pcall(function() Library:Unload() end) end
     if env.BlackFlashMacro then env.BlackFlashMacro.Stop() end
-    warn("[BF-LUA] Obsidian UI failed: "..tostring(uiError))
+    warn("[BF-LUA] UI failed: "..tostring(uiError))
 end
